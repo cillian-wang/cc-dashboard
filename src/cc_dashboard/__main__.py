@@ -64,6 +64,17 @@ def cwd_to_project_dir(cwd):
     return re.sub(r'[^a-zA-Z0-9]', '-', cwd)
 
 
+def _parse_etime_days(etime):
+    """Parse ps elapsed time (e.g. '3-12:05:01', '05:01', '131-04:36:35') into days."""
+    etime = etime.strip()
+    if "-" in etime:
+        return int(etime.split("-")[0])
+    parts = etime.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) / 24
+    return 0
+
+
 def get_running_claude_sessions():
     try:
         result = subprocess.run(
@@ -124,6 +135,17 @@ def get_running_claude_sessions():
                             break
             except OSError:
                 pass
+        # Filter out stale/dead sessions: IDE-spawned processes that lost their
+        # connections have very few open file descriptors (< 30) and have been
+        # running for over a day.  Terminal sessions on a pts/ are kept regardless.
+        if source != "terminal":
+            try:
+                fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+                uptime_days = _parse_etime_days(etime)
+                if fd_count < 30 and uptime_days >= 1:
+                    continue
+            except OSError:
+                continue  # process vanished
         sessions.append({"pid": pid, "tty": tty, "start": lstart_str, "elapsed": etime, "cwd": cwd, "source": source})
     return sessions
 
