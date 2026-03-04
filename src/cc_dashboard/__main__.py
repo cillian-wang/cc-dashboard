@@ -16,6 +16,8 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
+_IS_MACOS = sys.platform == "darwin"
+
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 TODOS_DIR = CLAUDE_DIR / "todos"
@@ -79,16 +81,97 @@ def _parse_etime_days(etime):
     return 0
 
 
+def _get_proc_cwd(pid):
+    """Get the current working directory of a process (cross-platform)."""
+    if _IS_MACOS:
+        try:
+            result = subprocess.run(
+                ["lsof", "-p", str(pid), "-Fn", "-a", "-d", "cwd"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if line.startswith("n") and line != "n":
+                    return line[1:]
+        except Exception:
+            pass
+        return ""
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def _get_ppid(pid):
+    """Get the parent PID of a process (cross-platform). Returns 0 on failure."""
+    if _IS_MACOS:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            return int(result.stdout.strip())
+        except Exception:
+            return 0
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _get_proc_cmdline(pid):
+    """Get the command line of a process (cross-platform)."""
+    if _IS_MACOS:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return ""
+    try:
+        return open(f"/proc/{pid}/cmdline").read()
+    except OSError:
+        return ""
+
+
+def _get_fd_count(pid):
+    """Get the number of open file descriptors for a process (cross-platform).
+    Returns -1 on failure."""
+    if _IS_MACOS:
+        try:
+            result = subprocess.run(
+                ["lsof", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Subtract 1 for the header line
+            lines = result.stdout.strip().split("\n")
+            return max(len(lines) - 1, 0)
+        except Exception:
+            return -1
+    try:
+        return len(os.listdir(f"/proc/{pid}/fd"))
+    except OSError:
+        return -1
+
+
 def get_running_claude_sessions():
     try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid,tty,lstart,etime,args", "--no-headers"],
-            capture_output=True, text=True,
-        )
+        ps_cmd = ["ps", "-eo", "pid,tty,lstart,etime,args"]
+        if not _IS_MACOS:
+            ps_cmd.append("--no-headers")
+        result = subprocess.run(ps_cmd, capture_output=True, text=True)
     except Exception:
         return []
     sessions = []
-    for line in result.stdout.strip().split("\n"):
+    lines = result.stdout.strip().split("\n")
+    if _IS_MACOS and lines:
+        lines = lines[1:]  # skip header line on macOS
+    for line in lines:
         if not line.strip():
             continue
         parts = line.split()
@@ -108,48 +191,34 @@ def get_running_claude_sessions():
         # This catches CLI sessions (pts/), IDE plugins (Cursor, VSCode, Zed), etc.
         if not (exe == "claude" or exe.endswith("/claude")):
             continue
-        cwd = ""
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except OSError:
-            pass
+        cwd = _get_proc_cwd(pid)
         # Determine session source from tty, command path, and parent process
-        if tty.startswith("pts/"):
+        if tty.startswith("pts/") or (_IS_MACOS and tty.startswith("ttys")):
             source = "terminal"
         elif "cursor-server" in cmd or "vscode-server" in cmd:
             source = "cursor"
         else:
             # Non-tty bare "claude" — check parent process to identify IDE
             source = "ide"
-            try:
-                with open(f"/proc/{pid}/status") as f:
-                    for sline in f:
-                        if sline.startswith("PPid:"):
-                            ppid = int(sline.split()[1])
-                            try:
-                                pcmd = open(f"/proc/{ppid}/cmdline").read()
-                                if "cursor" in pcmd.lower():
-                                    source = "cursor"
-                                elif "zed" in pcmd.lower() or "claude-code-acp" in pcmd:
-                                    source = "zed"
-                                elif "vscode" in pcmd.lower() or "code-server" in pcmd.lower():
-                                    source = "vscode"
-                            except OSError:
-                                pass
-                            break
-            except OSError:
-                pass
+            ppid = _get_ppid(pid)
+            if ppid:
+                pcmd = _get_proc_cmdline(ppid)
+                if "cursor" in pcmd.lower():
+                    source = "cursor"
+                elif "zed" in pcmd.lower() or "claude-code-acp" in pcmd:
+                    source = "zed"
+                elif "vscode" in pcmd.lower() or "code-server" in pcmd.lower():
+                    source = "vscode"
         # Filter out stale/dead sessions: IDE-spawned processes that lost their
         # connections have very few open file descriptors (< 30) and have been
         # running for over a day.  Terminal sessions on a pts/ are kept regardless.
         if source != "terminal":
-            try:
-                fd_count = len(os.listdir(f"/proc/{pid}/fd"))
-                uptime_days = _parse_etime_days(etime)
-                if fd_count < 30 and uptime_days >= 1:
-                    continue
-            except OSError:
+            fd_count = _get_fd_count(pid)
+            if fd_count < 0:
                 continue  # process vanished
+            uptime_days = _parse_etime_days(etime)
+            if fd_count < 30 and uptime_days >= 1:
+                continue
         sessions.append({"pid": pid, "tty": tty, "start": lstart_str, "elapsed": etime, "cwd": cwd, "source": source})
     return sessions
 
