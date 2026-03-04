@@ -87,14 +87,44 @@ def get_running_claude_sessions():
             cmd = " ".join(parts[8:])
         except (IndexError, ValueError):
             continue
-        if cmd.strip() != "claude" or not tty.startswith("pts/"):
+        # Extract the executable (first token of the command)
+        exe = cmd.split()[0] if cmd.split() else ""
+        # Match "claude" exactly or any path ending in /claude
+        # This catches CLI sessions (pts/), IDE plugins (Cursor, VSCode, Zed), etc.
+        if not (exe == "claude" or exe.endswith("/claude")):
             continue
         cwd = ""
         try:
             cwd = os.readlink(f"/proc/{pid}/cwd")
         except OSError:
             pass
-        sessions.append({"pid": pid, "tty": tty, "start": lstart_str, "elapsed": etime, "cwd": cwd})
+        # Determine session source from tty, command path, and parent process
+        if tty.startswith("pts/"):
+            source = "terminal"
+        elif "cursor-server" in cmd or "vscode-server" in cmd:
+            source = "cursor"
+        else:
+            # Non-tty bare "claude" — check parent process to identify IDE
+            source = "ide"
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    for sline in f:
+                        if sline.startswith("PPid:"):
+                            ppid = int(sline.split()[1])
+                            try:
+                                pcmd = open(f"/proc/{ppid}/cmdline").read()
+                                if "cursor" in pcmd.lower():
+                                    source = "cursor"
+                                elif "zed" in pcmd.lower() or "claude-code-acp" in pcmd:
+                                    source = "zed"
+                                elif "vscode" in pcmd.lower() or "code-server" in pcmd.lower():
+                                    source = "vscode"
+                            except OSError:
+                                pass
+                            break
+            except OSError:
+                pass
+        sessions.append({"pid": pid, "tty": tty, "start": lstart_str, "elapsed": etime, "cwd": cwd, "source": source})
     return sessions
 
 
@@ -377,6 +407,7 @@ def collect():
             "last_user_msg": (session_info or {}).get("last_user_msg", ""),
             "last_assistant_msg": (session_info or {}).get("last_assistant_msg", ""),
             "user_prompt_count": (session_info or {}).get("user_prompt_count", 0),
+            "source": proc_info.get("source", "terminal"),
             "todos": todos,
             "task_bar": render_task_bar(todos),
             "current_task": get_current_task(todos),
@@ -523,7 +554,12 @@ def _render_cards(sessions_data, MW, H, interval):
                 r1 = f"{r1_left}{' ' * gap}{badge}"
             card.append(r1)
 
-            meta = [f"pid:{pid}", f"tty:{tty}"]
+            source = s.get("source", "terminal")
+            meta = [f"pid:{pid}"]
+            if source != "terminal":
+                meta.append(source)
+            else:
+                meta.append(f"tty:{tty}")
             if slug:
                 meta.append(f'"{slug}"')
             card.append(f"{FG_GRAY}{' · '.join(meta)}{RESET}")
@@ -638,15 +674,17 @@ def _render_sidebar(sessions_data, SW, H, interval):
     buf.append(sline(hdr))
     buf.append(sline(f" {FG_DARK_GRAY}{'─' * (inner_w - 1)}{RESET}"))
 
+    source_icons = {"terminal": ">_", "cursor": "Cu", "vscode": "VS", "zed": "Ze", "ide": "ID"}
     for s in sessions_data:
         proj_name = os.path.basename(s["cwd"]) if s["cwd"] else "?"
         elapsed = format_elapsed_human(s["elapsed"])
         prompts = s.get("user_prompt_count", 0)
         st = s["status"]
+        src_icon = source_icons.get(s.get("source", "terminal"), ">_")
 
         nc = FG_BRIGHT_GREEN if st == "working" else (FG_BRIGHT_YELLOW if st == "waiting" else FG_DARK_GRAY)
-        name_t = truncate(proj_name, col_name - 1)
-        row_str = f" {nc}{pad_right(name_t, col_name)}{RESET}{FG_GRAY}{pad_right(elapsed, col_time)}{prompts:>{col_msgs}}{RESET}"
+        name_t = truncate(proj_name, col_name - 3)
+        row_str = f" {FG_GRAY}{src_icon}{RESET} {nc}{pad_right(name_t, col_name - 3)}{RESET}{FG_GRAY}{pad_right(elapsed, col_time)}{prompts:>{col_msgs}}{RESET}"
         buf.append(sline(row_str))
 
     buf.append(sdiv())
