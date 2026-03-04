@@ -21,6 +21,10 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 TODOS_DIR = CLAUDE_DIR / "todos"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 
+# Caches to avoid re-reading unchanged files every cycle
+_session_info_cache = {}   # str(path) -> (mtime, info_dict)
+_prompt_count_cache = {}   # str(path) -> (file_size, count)
+
 # ── ANSI ─────────────────────────────────────────────────────────────────────
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -161,36 +165,81 @@ def find_active_sessions_for_project(project_dir, count=5):
     return jsonl_files[:count]
 
 
+def _count_user_prompts(filepath):
+    """Count '"type":"user"' occurrences with incremental file-size caching."""
+    path_key = str(filepath)
+    fsize = filepath.stat().st_size
+    cached = _prompt_count_cache.get(path_key)
+    if cached:
+        last_size, last_count = cached
+        if fsize == last_size:
+            return last_count
+        if fsize > last_size:
+            with open(filepath, 'rb') as f:
+                f.seek(last_size)
+                new_data = f.read()
+            total = last_count + new_data.count(b'"type":"user"')
+            _prompt_count_cache[path_key] = (fsize, total)
+            return total
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    count = data.count(b'"type":"user"')
+    _prompt_count_cache[path_key] = (fsize, count)
+    return count
+
+
+def _read_tail_lines(filepath, n_lines):
+    """Read last n_lines from a file without subprocess."""
+    with open(filepath, 'rb') as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        if fsize == 0:
+            return []
+        chunk = min(fsize, n_lines * 8192)
+        while True:
+            f.seek(fsize - chunk)
+            data = f.read().decode('utf-8', errors='replace')
+            lines = data.split('\n')
+            if chunk < fsize:
+                lines = lines[1:]  # first line may be partial
+            if lines and not lines[-1]:
+                lines = lines[:-1]
+            if len(lines) >= n_lines or chunk >= fsize:
+                return lines[-n_lines:]
+            chunk = min(fsize, chunk * 2)
+
+
 def read_session_info(jsonl_path):
+    path_key = str(jsonl_path)
+    st = jsonl_path.stat()
+    current_mtime = st.st_mtime
+
+    # Return cached result if file hasn't been modified
+    cached = _session_info_cache.get(path_key)
+    if cached and cached[0] == current_mtime:
+        return cached[1]
+
     session_id = jsonl_path.stem
     info = {
         "session_id": session_id, "slug": "", "last_user_msg": "",
         "last_assistant_msg": "", "permission_mode": "", "git_branch": "",
-        "version": "", "mtime": jsonl_path.stat().st_mtime,
+        "version": "", "mtime": current_mtime,
         "last_stop_reason": "", "last_tool_name": "",
         "has_tool_result_after": False, "has_progress_after": False,
     }
     try:
-        # Count user prompts (fast grep over full file)
-        try:
-            cr = subprocess.run(
-                ["grep", "-c", '"type":"user"', str(jsonl_path)],
-                capture_output=True, text=True,
-            )
-            info["user_prompt_count"] = int(cr.stdout.strip()) if cr.returncode == 0 else 0
-        except Exception:
-            info["user_prompt_count"] = 0
+        info["user_prompt_count"] = _count_user_prompts(jsonl_path)
 
-        tail_n = "500" if jsonl_path.stat().st_size > 500_000 else "80"
-        result = subprocess.run(["tail", "-" + tail_n, str(jsonl_path)], capture_output=True, text=True)
+        tail_n = 500 if st.st_size > 500_000 else 80
+        tail_lines = _read_tail_lines(jsonl_path, tail_n)
 
         last_stop = ""
         last_tool = ""
         saw_result = False
         saw_progress = False
-        last_entry_type = ""  # type of the very last JSONL entry
+        last_entry_type = ""
 
-        for line in result.stdout.strip().split("\n"):
+        for line in tail_lines:
             try:
                 d = json.loads(line.strip())
             except json.JSONDecodeError:
@@ -263,6 +312,7 @@ def read_session_info(jsonl_path):
         info["last_entry_type"] = last_entry_type
     except Exception:
         pass
+    _session_info_cache[path_key] = (current_mtime, info)
     return info
 
 
@@ -870,7 +920,7 @@ def render_fullscreen(sessions_data, interval, W, H):
 
 def main():
     parser = argparse.ArgumentParser(description="Live full-screen dashboard for Claude Code sessions")
-    parser.add_argument("-n", "--interval", type=float, default=3, help="Refresh interval in seconds (default: 3)")
+    parser.add_argument("-n", "--interval", type=float, default=1, help="Refresh interval in seconds (default: 1)")
     parser.add_argument("--once", action="store_true", help="Print once and exit (no live refresh)")
     args = parser.parse_args()
 

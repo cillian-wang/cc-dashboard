@@ -11,7 +11,7 @@ pip install cc-dashboard
 ## Usage
 
 ```bash
-# Live dashboard (refreshes every 3s)
+# Live dashboard (refreshes every 1s)
 cc-dashboard
 
 # Single snapshot and exit
