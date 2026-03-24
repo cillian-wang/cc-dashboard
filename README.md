@@ -2,6 +2,10 @@
 
 Live full-screen terminal dashboard for all running Claude Code sessions.
 
+## Demo
+
+[Watch the demo video](./assets/demo-0623.mp4)
+
 ## Install
 
 ```
